@@ -225,7 +225,7 @@ class GGUFReader:
             return count * 4
         if info.type_name == "F16":
             return count * 2
-        if info.type_name in ("Q4_0", "Q4_1", "Q8_0"):
+        if info.type_name in ("Q4_0", "Q4_1", "Q5_0", "Q8_0"):
             if count % 32 != 0:
                 raise ValueError(f"{info.type_name} tensor size must be divisible by 32")
             return (count // 32) * self._legacy_block_bytes(info.type_name)
@@ -233,6 +233,10 @@ class GGUFReader:
             if count % 256 != 0:
                 raise ValueError("Q4_K tensor size must be divisible by 256")
             return (count // 256) * 144
+        if info.type_name == "Q6_K":
+            if count % 256 != 0:
+                raise ValueError("Q6_K tensor size must be divisible by 256")
+            return (count // 256) * 210
         raise NotImplementedError(f"tensor size not implemented for {info.type_name}")
 
     def tensor_info(self, name: str) -> TensorInfo:
@@ -259,6 +263,8 @@ class GGUFReader:
             return 18
         if type_name == "Q4_1":
             return 20
+        if type_name == "Q5_0":
+            return 22
         if type_name == "Q8_0":
             return 34
         raise NotImplementedError(f"tensor decoder not implemented for {type_name}")
@@ -323,6 +329,50 @@ class GGUFReader:
                 decoded[start : start + 32] = values * scale - minimum
         return decoded
 
+    def _decode_q5_0_blocks(self, raw: bytes, block_count: int) -> np.ndarray:
+        raw_array = np.frombuffer(raw, dtype=np.uint8)
+        decoded = np.empty(block_count * 32, dtype=np.float32)
+        for block_index in range(block_count):
+            block = raw_array[block_index * 22 : (block_index + 1) * 22]
+            scale = np.frombuffer(block[:2].tobytes(), dtype="<f2")[0].astype(np.float32)
+            high_bits = int.from_bytes(block[2:6].tobytes(), "little")
+            quants = block[6:]
+            for j in range(16):
+                low0 = int(quants[j] & 0x0F)
+                low1 = int(quants[j] >> 4)
+                hi0 = ((high_bits >> j) & 1) << 4
+                hi1 = ((high_bits >> (j + 16)) & 1) << 4
+                decoded[block_index * 32 + j] = (low0 | hi0) * scale - 16 * scale
+                decoded[block_index * 32 + j + 16] = (low1 | hi1) * scale - 16 * scale
+        return decoded
+
+    def _decode_q6_k_blocks(self, raw: bytes, block_count: int) -> np.ndarray:
+        raw_array = np.frombuffer(raw, dtype=np.uint8)
+        decoded = np.empty(block_count * 256, dtype=np.float32)
+        for block_index in range(block_count):
+            block = raw_array[block_index * 210 : (block_index + 1) * 210]
+            ql = block[:128]
+            qh = block[128:192]
+            scales = block[192:208].view(np.int8)
+            scale = np.frombuffer(block[208:210].tobytes(), dtype="<f2")[0].astype(np.float32)
+            output = decoded[block_index * 256 : (block_index + 1) * 256]
+            for half in range(2):
+                ql_half = ql[64 * half : 64 * half + 64]
+                qh_half = qh[32 * half : 32 * half + 32]
+                scales_half = scales[8 * half : 8 * half + 8]
+                output_half = output[128 * half : 128 * half + 128]
+                for l in range(32):
+                    group = l // 16
+                    q1 = (int(ql_half[l] & 0x0F) | ((int(qh_half[l]) & 3) << 4)) - 32
+                    q2 = (int(ql_half[l + 32] & 0x0F) | ((int(qh_half[l] >> 2) & 3) << 4)) - 32
+                    q3 = (int(ql_half[l] >> 4) | ((int(qh_half[l] >> 4) & 3) << 4)) - 32
+                    q4 = (int(ql_half[l + 32] >> 4) | ((int(qh_half[l] >> 6) & 3) << 4)) - 32
+                    output_half[l] = scale * int(scales_half[group]) * q1
+                    output_half[l + 32] = scale * int(scales_half[group + 2]) * q2
+                    output_half[l + 64] = scale * int(scales_half[group + 4]) * q3
+                    output_half[l + 96] = scale * int(scales_half[group + 6]) * q4
+        return decoded
+
     def _decode_legacy_vector(self, info: TensorInfo, byte_offset: int, count: int) -> np.ndarray:
         if count % 32 != 0:
             raise ValueError(f"{info.type_name} vector length must be divisible by 32")
@@ -352,6 +402,14 @@ class GGUFReader:
             row_bytes = (width // 32) * self._legacy_block_bytes(type_name)
             raw = self.tensor_bytes(info, row_bytes, index * row_bytes)
             return self._decode_legacy_blocks(raw, type_name, width // 32)
+        if type_name == "Q5_0":
+            row_bytes = (width // 32) * 22
+            raw = self.tensor_bytes(info, row_bytes, index * row_bytes)
+            return self._decode_q5_0_blocks(raw, width // 32)
+        if type_name == "Q6_K":
+            row_bytes = (width // 256) * 210
+            raw = self.tensor_bytes(info, row_bytes, index * row_bytes)
+            return self._decode_q6_k_blocks(raw, width // 256)
         if type_name == "Q4_K":
             row_bytes = (width // 256) * 144
             raw = self.tensor_bytes(info, row_bytes, index * row_bytes)
@@ -390,6 +448,18 @@ class GGUFReader:
             values = np.frombuffer(raw, dtype="<f2").astype(np.float32, copy=True)
         elif type_name in ("Q4_0", "Q4_1", "Q8_0"):
             values = self._decode_legacy_quant(info)
+        elif type_name == "Q5_0":
+            if count % 32 != 0:
+                raise ValueError("Q5_0 tensor size must be divisible by 32")
+            values = self._decode_q5_0_blocks(
+                self.tensor_bytes(info, (count // 32) * 22), count // 32
+            )
+        elif type_name == "Q6_K":
+            if count % 256 != 0:
+                raise ValueError("Q6_K tensor size must be divisible by 256")
+            values = self._decode_q6_k_blocks(
+                self.tensor_bytes(info, (count // 256) * 210), count // 256
+            )
         elif type_name == "Q4_K":
             if count % 256 != 0:
                 raise ValueError("Q4_K tensor size must be divisible by 256")

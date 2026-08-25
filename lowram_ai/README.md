@@ -79,3 +79,24 @@ The custom `LRQ1` format stores symmetric per-group scales and supports 4-bit an
 ## References
 
 The binary layout follows the [official GGUF specification](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md). Llama tensor naming and reversed GGML/PyTorch dimension conventions follow the [llama.cpp model-architecture guide](https://github.com/ggml-org/llama.cpp/blob/master/docs/development/HOWTO-add-model.md). Q4_K block structure and dequantization ordering are cross-checked against the upstream [ggml common quantization definitions](https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-common.h) and [scalar dequantization reference](https://docs.rs/ramvamp-core/latest/src/ramvamp_core/kernels/quants/dequant.rs.html).
+
+## Native production path
+
+The portable Python path is useful for correctness tests and unsupported formats. For practical CPU inference, build the C++20 library from `native/`; the Python runtime discovers `native/build/liblowram_kernel.so`, `.dylib`, or the Windows DLL automatically, or uses `LOWRAM_KERNEL_PATH` when explicitly set.
+
+```bash
+cmake -S native -B native/build -DCMAKE_BUILD_TYPE=Release
+cmake --build native/build --config Release -j2
+python3 -m pip install -e .
+lowram-ai generate model.gguf "Hello" --max-new-tokens 32 --max-context 256 --max-ram-mb 1024
+```
+
+The native backend accelerates F32, F16, Q4_K, Q5_0, Q6_K, and Q8_0 matvec operations. Python remains the correctness fallback for formats without a native kernel. Use `scripts/benchmark_real_model.py` to compare native and Python outputs and to measure peak RSS and tokens per second on the target device.
+
+## Real-model validation
+
+The release was exercised with SmolLM2-135M-Instruct Q4_K_M. The tested GGUF file was 105,454,432 bytes; four generated tokens completed at approximately 3.99 tokens/second on the sandbox CPU, with approximately 177 MiB peak RSS. Sampled native/Python matvec comparisons had maximum absolute error below 1.4e-5. These are validation measurements, not a guarantee for every CPU or Android device.
+
+## References
+
+The binary layout follows the [official GGUF specification](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md). Llama tensor naming and model metadata follow the [llama.cpp model-architecture guide](https://github.com/ggml-org/llama.cpp/blob/master/docs/development/HOWTO-add-model.md). Q4_K block structure and dequantization ordering are cross-checked against the upstream [ggml common quantization definitions](https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-common.h) and the [scalar Q4_K reference](https://docs.rs/ramvamp-core/latest/src/ramvamp_core/kernels/quants/dequant.rs.html).

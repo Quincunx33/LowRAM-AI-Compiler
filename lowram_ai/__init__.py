@@ -2,6 +2,7 @@
 
 from .gguf import GGUFReader, TensorInfo
 from .llama import LlamaConfig, LlamaRuntime, MultiHeadKVCache
+from .native import NativeKernel
 from .tokenizer import Tokenizer
 from .planner import BudgetPlan, build_budget_plan
 from .quantized import QuantizedMatrix, quantize_npy_matrix
@@ -13,6 +14,7 @@ __all__ = [
     "LlamaConfig",
     "LlamaRuntime",
     "MultiHeadKVCache",
+    "NativeKernel",
     "TensorInfo",
     "KVCache",
     "QuantizedMatrix",

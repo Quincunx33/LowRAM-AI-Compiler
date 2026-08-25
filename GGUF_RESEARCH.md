@@ -28,3 +28,9 @@ The first full-generation implementation will target a narrow Llama-family layou
 The upstream `ggml-common.h` defines `block_q4_K` as a 256-value super-block containing two fp16 super-scales, 12 bytes of packed 6-bit sub-block scales/minima, and 128 bytes of 4-bit quants, for 144 bytes total. The reference `dequantize_row_q4_K` implementation in upstream `ggml-quants.c` is the source of truth for the exact scale unpacking and sub-block ordering. Q4_K support is therefore the next quantization milestone after this complete legacy-Q4 generation path.
 
 The focused scalar reference confirms Q4_K ordering: each 256-value super-block has four 64-value spans. Each span uses 32 packed bytes; the low nibbles produce one contiguous 32-value sub-block and the high nibbles produce the next. The weight formula is `w = d * scale_q * q - dmin * min_q`. This means the decoder must process sub-blocks in pairs per 64-value span, not map each 32-byte region to one sub-block by parity across the whole block.
+
+## Real-model compatibility audit
+
+The selected public `bartowski/SmolLM2-135M-Instruct-Q4_K_M.gguf` file is approximately 101 MiB and reports `general.architecture=llama`, 30 layers, embedding length 576, feed-forward length 1536, 9 attention heads, 3 KV heads, and a 8192-token context. Its tokenizer metadata reports `tokenizer.ggml.model=gpt2`, with 49,152 tokens and embedded merges. Its tensor mix includes Q4_K, Q5_0, Q6_K, Q8_0, F32, and F16-compatible entries; therefore a real run requires Q5_0/Q6_K decoders and GPT-2 BPE tokenization in addition to the initial legacy-Q4 path.
+
+The current `GGUFReader` retains a `Path` field, parses descriptors first, and owns a Python mmap that is closed via the context manager. The native backend can therefore open the same path independently and must be closed before the reader mapping is released.

@@ -41,3 +41,19 @@ See [`lowram_ai/README.md`](lowram_ai/README.md) for design details, limitations
 ## References
 
 The GGUF layout and tensor metadata conventions follow the [official GGUF specification](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md) and the [llama.cpp model-architecture guide](https://github.com/ggml-org/llama.cpp/blob/master/docs/development/HOWTO-add-model.md). The supported quantization descriptions are cross-checked against the [Hugging Face GGUF documentation](https://huggingface.co/docs/hub/en/gguf) and upstream [ggml quantization structures](https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-common.h).
+
+## Production-oriented native path
+
+The Python implementation remains the portable correctness fallback. For real CPU inference, build the optional C++20 shared library and let the runtime discover it automatically:
+
+```bash
+sudo apt-get install cmake g++
+cmake -S native -B native/build -DCMAKE_BUILD_TYPE=Release
+cmake --build native/build --config Release -j2
+python3 -m pip install -e .
+lowram-ai generate model.gguf "Hello" --max-new-tokens 32 --max-context 256 --max-ram-mb 1024
+```
+
+The native library includes mmap-backed F32/F16, Q5_0, Q6_K, Q8_0, and Q4_K matvec kernels. The runtime falls back to Python for unsupported legacy affine kernels, so model correctness is not tied to native build availability.
+
+A repeatable real-model benchmark is provided at `scripts/benchmark_real_model.py`. The release validation used SmolLM2-135M-Instruct Q4_K_M, a 105,454,432-byte GGUF file. On the sandbox CPU, the native path generated four new tokens at approximately 3.99 tokens/second with a measured peak RSS of approximately 177 MiB; native versus Python matvec comparisons stayed within 1.4e-5 maximum absolute error on sampled Q4_K/Q5_0/Q6_K tensors. These measurements are host-specific and must be repeated on the target device.

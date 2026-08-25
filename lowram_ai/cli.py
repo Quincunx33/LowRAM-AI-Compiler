@@ -53,6 +53,11 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--max-new-tokens", type=_positive_int, default=32)
     generate.add_argument("--max-context", type=_positive_int, default=None)
     generate.add_argument("--max-ram-mb", type=_positive_int, default=None)
+    generate.add_argument("--temperature", type=float, default=0.0)
+    generate.add_argument("--top-k", type=int, default=40)
+    generate.add_argument("--top-p", type=float, default=0.9)
+    generate.add_argument("--repetition-penalty", type=float, default=1.05)
+    generate.add_argument("--seed", type=int, default=0)
 
     run = commands.add_parser("run", help="run a memory-mapped matrix-vector product")
     run.add_argument("matrix", type=Path)
@@ -107,7 +112,15 @@ def main(argv: list[str] | None = None) -> int:
             max_context_tokens=args.max_context,
             max_ram_mb=args.max_ram_mb,
         ) as runtime:
-            print(runtime.generate(args.prompt, max_new_tokens=args.max_new_tokens))
+            print(runtime.generate(
+                args.prompt,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                top_p=args.top_p,
+                repetition_penalty=args.repetition_penalty,
+                seed=args.seed,
+            ))
         return 0
 
     if args.command == "run":

@@ -15,6 +15,7 @@ import numpy as np
 
 from .gguf import GGUFReader
 from .memory import enforce_rss_budget
+from .native import NativeKernel
 from .tokenizer import Tokenizer
 from .transformer import apply_rope, rms_norm, silu
 
@@ -131,6 +132,7 @@ class LlamaRuntime:
         max_ram_mb: int | None = None,
     ):
         self.reader = reader
+        self.native: NativeKernel | None = None
         self.max_ram_mb = max_ram_mb
         self.tokenizer = Tokenizer.from_metadata(reader.metadata)
         self.config = LlamaConfig.from_reader(reader, self.tokenizer)
@@ -159,6 +161,7 @@ class LlamaRuntime:
                     f"> {self.max_ram_mb} MiB"
                 )
             enforce_rss_budget(self.max_ram_mb)
+        self.native = NativeKernel.try_open(reader.path)
 
     @classmethod
     def open(
@@ -175,6 +178,9 @@ class LlamaRuntime:
         )
 
     def close(self) -> None:
+        if self.native is not None:
+            self.native.close()
+            self.native = None
         self.reader.close()
 
     def __enter__(self) -> "LlamaRuntime":
@@ -205,10 +211,14 @@ class LlamaRuntime:
 
     def _linear(self, name: str, vector: np.ndarray) -> np.ndarray:
         info = self.reader.tensor_info(name)
-        if info.type_name not in {"F32", "F16", "Q4_0", "Q4_1", "Q4_K", "Q8_0"}:
+        if info.type_name not in {"F32", "F16", "Q4_0", "Q4_1", "Q4_K", "Q5_0", "Q6_K", "Q8_0"}:
             raise NotImplementedError(
                 f"tensor {name} uses {info.type_name}; add its decoder before running this model"
             )
+        if self.native is not None:
+            native_result = self.native.matvec(info, vector)
+            if native_result is not None:
+                return native_result
         return self.reader.tensor_matvec(info, vector)
 
     def _apply_rope_heads(self, values: np.ndarray, head_count: int) -> np.ndarray:
@@ -311,12 +321,67 @@ class LlamaRuntime:
         ]
         self.position = 0
 
+    @staticmethod
+    def _sample_next(
+        logits: np.ndarray,
+        generated: list[int],
+        *,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        repetition_penalty: float,
+        rng: np.random.Generator,
+    ) -> int:
+        if temperature < 0:
+            raise ValueError("temperature must be non-negative")
+        if top_k < 0:
+            raise ValueError("top_k must be non-negative")
+        if not 0 < top_p <= 1:
+            raise ValueError("top_p must be in (0, 1]")
+        if repetition_penalty < 1:
+            raise ValueError("repetition_penalty must be at least 1")
+        scores = np.asarray(logits, dtype=np.float32).copy()
+        if repetition_penalty > 1:
+            for token_id in set(generated[-128:]):
+                if scores[token_id] < 0:
+                    scores[token_id] *= repetition_penalty
+                else:
+                    scores[token_id] /= repetition_penalty
+        if temperature == 0:
+            return int(np.argmax(scores))
+        scores /= temperature
+        if top_k > 0 and top_k < scores.size:
+            threshold = np.partition(scores, -top_k)[-top_k]
+            scores[scores < threshold] = -np.inf
+        finite = np.isfinite(scores)
+        finite_scores = scores[finite]
+        if finite_scores.size == 0:
+            return int(np.argmax(logits))
+        probabilities = np.zeros_like(scores, dtype=np.float64)
+        shifted = finite_scores - np.max(finite_scores)
+        probabilities[finite] = np.exp(shifted)
+        probabilities /= probabilities.sum()
+        if top_p < 1:
+            sorted_ids = np.argsort(probabilities)[::-1]
+            cumulative = np.cumsum(probabilities[sorted_ids])
+            remove = cumulative > top_p
+            if remove.any():
+                remove[0] = False
+                probabilities[sorted_ids[remove]] = 0
+                probabilities /= probabilities.sum()
+        return int(rng.choice(scores.size, p=probabilities))
+
     def generate_ids(
         self,
         prompt: str,
         *,
         max_new_tokens: int = 32,
-        add_bos: bool = True,
+        add_bos: bool | None = None,
+        temperature: float = 0.0,
+        top_k: int = 40,
+        top_p: float = 0.9,
+        repetition_penalty: float = 1.05,
+        seed: int | None = 0,
     ) -> list[int]:
         if max_new_tokens <= 0:
             raise ValueError("max_new_tokens must be positive")
@@ -324,16 +389,45 @@ class LlamaRuntime:
         if not prompt_ids:
             raise ValueError("prompt encoded to zero tokens")
         generated = list(prompt_ids)
+        rng = np.random.default_rng(seed)
         logits = np.empty(self.tokenizer.vocab_size, dtype=np.float32)
         for token_id in prompt_ids:
             logits = self.forward_token(token_id)
         for _ in range(max_new_tokens):
-            next_id = int(np.argmax(logits))
+            next_id = self._sample_next(
+                logits,
+                generated,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                rng=rng,
+            )
             generated.append(next_id)
             if self.config.eos_token_id is not None and next_id == self.config.eos_token_id:
                 break
             logits = self.forward_token(next_id)
         return generated
 
-    def generate(self, prompt: str, *, max_new_tokens: int = 32) -> str:
-        return self.tokenizer.decode(self.generate_ids(prompt, max_new_tokens=max_new_tokens))
+    def generate(
+        self,
+        prompt: str,
+        *,
+        max_new_tokens: int = 32,
+        temperature: float = 0.0,
+        top_k: int = 40,
+        top_p: float = 0.9,
+        repetition_penalty: float = 1.05,
+        seed: int | None = 0,
+    ) -> str:
+        return self.tokenizer.decode(
+            self.generate_ids(
+                prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                seed=seed,
+            )
+        )
