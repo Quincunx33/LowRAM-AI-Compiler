@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .gguf import GGUFReader, inspect_gguf
 from .planner import build_budget_plan
 from .quantized import QuantizedMatrix, quantize_npy_matrix
 
@@ -41,6 +42,10 @@ def build_parser() -> argparse.ArgumentParser:
     quantize.add_argument("--group-size", type=_positive_int, default=64)
     quantize.add_argument("--chunk-rows", type=_positive_int, default=32)
 
+    inspect = commands.add_parser("inspect-gguf", help="inspect GGUF metadata and tensor descriptors")
+    inspect.add_argument("path", type=Path)
+    inspect.add_argument("--decode", type=str, help="decode one supported tensor and show a preview")
+
     run = commands.add_parser("run", help="run a memory-mapped matrix-vector product")
     run.add_argument("matrix", type=Path)
     run.add_argument("--seed", type=int, default=7)
@@ -72,6 +77,20 @@ def main(argv: list[str] | None = None) -> int:
             chunk_rows=args.chunk_rows,
         )
         print(json.dumps(result, indent=2))
+        return 0
+
+    if args.command == "inspect-gguf":
+        if args.decode:
+            with GGUFReader(args.path) as reader:
+                tensor = reader.decode_tensor(args.decode)
+                print(json.dumps({
+                    "tensor": args.decode,
+                    "shape": list(tensor.shape),
+                    "dtype": str(tensor.dtype),
+                    "preview": np.round(tensor.reshape(-1)[:16], 6).tolist(),
+                }, indent=2))
+        else:
+            print(json.dumps(inspect_gguf(args.path), indent=2))
         return 0
 
     if args.command == "run":
