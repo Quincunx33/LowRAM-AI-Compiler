@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from .gguf import GGUFReader, inspect_gguf
+from .llama import LlamaRuntime
 from .planner import build_budget_plan
 from .quantized import QuantizedMatrix, quantize_npy_matrix
 
@@ -45,6 +46,13 @@ def build_parser() -> argparse.ArgumentParser:
     inspect = commands.add_parser("inspect-gguf", help="inspect GGUF metadata and tensor descriptors")
     inspect.add_argument("path", type=Path)
     inspect.add_argument("--decode", type=str, help="decode one supported tensor and show a preview")
+
+    generate = commands.add_parser("generate", help="generate text with a supported Llama GGUF model")
+    generate.add_argument("model", type=Path)
+    generate.add_argument("prompt", type=str)
+    generate.add_argument("--max-new-tokens", type=_positive_int, default=32)
+    generate.add_argument("--max-context", type=_positive_int, default=None)
+    generate.add_argument("--max-ram-mb", type=_positive_int, default=None)
 
     run = commands.add_parser("run", help="run a memory-mapped matrix-vector product")
     run.add_argument("matrix", type=Path)
@@ -91,6 +99,15 @@ def main(argv: list[str] | None = None) -> int:
                 }, indent=2))
         else:
             print(json.dumps(inspect_gguf(args.path), indent=2))
+        return 0
+
+    if args.command == "generate":
+        with LlamaRuntime.open(
+            str(args.model),
+            max_context_tokens=args.max_context,
+            max_ram_mb=args.max_ram_mb,
+        ) as runtime:
+            print(runtime.generate(args.prompt, max_new_tokens=args.max_new_tokens))
         return 0
 
     if args.command == "run":

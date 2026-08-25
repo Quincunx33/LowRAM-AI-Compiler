@@ -1,8 +1,8 @@
 # LowRAM AI MVP
 
-LowRAM AI is a first prototype for running quantized model components under a strict memory budget. It currently implements a streaming row-wise quantizer for dense `.npy` matrices, a compact `LRQ1` binary format, a memory-mapped reader, and a matrix-vector runtime that does not materialize the full float32 matrix.
+LowRAM AI is a low-memory inference prototype for running quantized model components under a strict memory budget. It implements a streaming row-wise quantizer for dense `.npy` matrices, a compact `LRQ1` binary format, a bounded-memory GGUF reader, a memory-mapped tensor runtime, and a narrow Llama-family text-generation loop.
 
-This is an inference primitive, not yet a complete LLM compiler. The purpose of this MVP is to prove the most important constraint: **weights can be stored compactly and consumed in small working buffers instead of being fully expanded in RAM**.
+The project is intentionally architecture-specific at this stage. Its main constraint is explicit: **weights and KV cache must be accounted for before generation, and tensor payloads must not be fully expanded into RAM**.
 
 ## What is included
 
@@ -46,6 +46,13 @@ python3 -m lowram_ai inspect-gguf model.gguf
 python3 -m lowram_ai inspect-gguf model.gguf --decode token_embd.weight
 ```
 
+Generate text with a supported Llama GGUF model and enforce a 1 GB ceiling:
+
+```bash
+python3 -m lowram_ai generate model.gguf "Hello" \
+  --max-new-tokens 32 --max-context 256 --max-ram-mb 1024
+```
+
 Run the end-to-end demo:
 
 ```bash
@@ -63,8 +70,12 @@ PYTHONPATH=. python3 -m unittest discover -s lowram_ai/tests -p 'test_*.py' -v
 
 A 1 GB device cannot normally dedicate its entire RAM to the model. The planner therefore uses a conservative application budget. A practical first target is a 300M–1.5B parameter model with 4-bit weights, batch size one, and a 256–512 token context. Larger models require distillation, more aggressive quantization, or partial offload and will not necessarily be smooth on a true 1 GB device.
 
-The current runtime is intentionally simple. The transformer block is a foundation for validation, not a full model architecture loader. Its next production steps are architecture-specific GGUF tensor mapping, tokenizer integration, multi-layer generation, operator fusion, optimized quantized linear and attention kernels, KV-cache paging/compression, and target backends for Android NDK, Linux, Windows, and iOS Metal/Core ML integration.
+The current runtime supports one Llama-family architecture with standard `blk.{layer}.*` tensor names, embedded tokenizer metadata, multi-head/grouped-query attention, greedy decoding, a fixed-capacity float16 KV cache, and a `--max-ram-mb` guard. Its next production steps are Q4_K/I-quants, optimized quantized kernels, sampling, chat templates, more architectures, and Android NDK or native mobile bindings.
 
 ## Scope and limitations
 
-The custom `LRQ1` format stores symmetric per-group scales and supports 4-bit and 8-bit dense matrices. GGUF reading is currently metadata-first and supports only selected legacy tensor types. The project does not yet import PyTorch, ONNX, or Safetensors models; it does not implement tokenization; and it does not provide a complete text-generation loop. Numerical accuracy and peak RSS should be measured again on the intended device before any release claim.
+The custom `LRQ1` format stores symmetric per-group scales and supports 4-bit and 8-bit dense matrices. GGUF reading is metadata-first and supports selected legacy tensor types: F32, F16, Q4_0, Q4_1, and Q8_0. The Llama runtime requires standard tensor names and currently uses greedy generation. Numerical accuracy, latency, and peak RSS must still be measured on the intended device before any release claim.
+
+## References
+
+The binary layout follows the [official GGUF specification](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md). Llama tensor naming and reversed GGML/PyTorch dimension conventions follow the [llama.cpp model-architecture guide](https://github.com/ggml-org/llama.cpp/blob/master/docs/development/HOWTO-add-model.md). Q4_K block structure and dequantization ordering are cross-checked against the upstream [ggml common quantization definitions](https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-common.h) and [scalar dequantization reference](https://docs.rs/ramvamp-core/latest/src/ramvamp_core/kernels/quants/dequant.rs.html).

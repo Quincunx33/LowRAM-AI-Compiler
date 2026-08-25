@@ -99,3 +99,43 @@ class GGUFReaderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def build_q4k_fixture(path: Path) -> np.ndarray:
+    metadata = gguf_string("general.alignment") + struct.pack("<I", 4) + struct.pack("<I", 32)
+    packed_scales = bytes([1] * 12)
+    q_bytes = bytes([0x21] * 128)
+    block = np.float16(1.0).tobytes() + np.float16(0.5).tobytes() + packed_scales + q_bytes
+    descriptor = (
+        gguf_string("test.q4k")
+        + struct.pack("<I", 1)
+        + struct.pack("<Q", 256)
+        + struct.pack("<I", 12)
+        + struct.pack("<Q", 0)
+    )
+    header = b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", 1) + struct.pack("<Q", 1) + metadata + descriptor
+    data_start = align_offset(len(header), 32)
+    path.write_bytes(header + b"\x00" * (data_start - len(header)) + block)
+    expected = np.concatenate(
+        [
+            np.full(32, 0.5, dtype=np.float32),
+            np.full(32, 1.5, dtype=np.float32),
+            np.full(32, 0.5, dtype=np.float32),
+            np.full(32, 1.5, dtype=np.float32),
+            np.full(32, 1.0, dtype=np.float32),
+            np.full(32, 2.0, dtype=np.float32),
+            np.full(32, 1.0, dtype=np.float32),
+            np.full(32, 2.0, dtype=np.float32),
+        ]
+    )
+    return expected
+
+
+class Q4KTests(unittest.TestCase):
+    def test_q4k_block_decodes_with_correct_span_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "q4k.gguf"
+            expected = build_q4k_fixture(path)
+            with GGUFReader(path) as reader:
+                self.assertEqual(reader.tensor_nbytes("test.q4k"), 144)
+                np.testing.assert_allclose(reader.decode_tensor("test.q4k"), expected)

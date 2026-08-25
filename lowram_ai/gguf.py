@@ -217,6 +217,24 @@ class GGUFReader:
                 data_offset=data_offset,
             )
 
+    def tensor_nbytes(self, tensor: str | TensorInfo) -> int:
+        """Estimate the exact payload size for supported GGML tensor types."""
+        info = self.tensor_info(tensor) if isinstance(tensor, str) else tensor
+        count = info.element_count
+        if info.type_name == "F32":
+            return count * 4
+        if info.type_name == "F16":
+            return count * 2
+        if info.type_name in ("Q4_0", "Q4_1", "Q8_0"):
+            if count % 32 != 0:
+                raise ValueError(f"{info.type_name} tensor size must be divisible by 32")
+            return (count // 32) * self._legacy_block_bytes(info.type_name)
+        if info.type_name == "Q4_K":
+            if count % 256 != 0:
+                raise ValueError("Q4_K tensor size must be divisible by 256")
+            return (count // 256) * 144
+        raise NotImplementedError(f"tensor size not implemented for {info.type_name}")
+
     def tensor_info(self, name: str) -> TensorInfo:
         try:
             return self.tensors[name]
@@ -226,14 +244,134 @@ class GGUFReader:
     def iter_tensors(self) -> Iterator[TensorInfo]:
         return iter(self.tensors.values())
 
-    def tensor_bytes(self, tensor: str | TensorInfo, count: int) -> bytes:
+    def tensor_bytes(self, tensor: str | TensorInfo, count: int, offset: int = 0) -> bytes:
         """Read an explicitly bounded byte range from a tensor payload."""
         info = self.tensor_info(tensor) if isinstance(tensor, str) else tensor
-        if count < 0 or info.data_offset + count > self.path.stat().st_size:
+        if offset < 0 or count < 0 or info.data_offset + offset + count > self.path.stat().st_size:
             raise ValueError("tensor byte range exceeds file")
         if self._mapping is None:
             raise RuntimeError("GGUFReader is closed")
-        return bytes(self._mapping[info.data_offset : info.data_offset + count])
+        start = info.data_offset + offset
+        return bytes(self._mapping[start : start + count])
+
+    def _legacy_block_bytes(self, type_name: str) -> int:
+        if type_name == "Q4_0":
+            return 18
+        if type_name == "Q4_1":
+            return 20
+        if type_name == "Q8_0":
+            return 34
+        raise NotImplementedError(f"tensor decoder not implemented for {type_name}")
+
+    def _decode_legacy_blocks(self, raw: bytes, type_name: str, block_count: int) -> np.ndarray:
+        bytes_per_block = self._legacy_block_bytes(type_name)
+        raw_array = np.frombuffer(raw, dtype=np.uint8)
+        decoded = np.empty(block_count * 32, dtype=np.float32)
+        for block in range(block_count):
+            source = raw_array[block * bytes_per_block : (block + 1) * bytes_per_block]
+            if type_name == "Q4_0":
+                scale = np.frombuffer(source[:2].tobytes(), dtype="<f2")[0].astype(np.float32)
+                nibbles = source[2:]
+                q = np.empty(32, dtype=np.float32)
+                q[:16] = (nibbles & 0x0F).astype(np.float32) - 8
+                q[16:] = (nibbles >> 4).astype(np.float32) - 8
+                decoded[block * 32 : (block + 1) * 32] = q * scale
+            elif type_name == "Q4_1":
+                scale = np.frombuffer(source[:2].tobytes(), dtype="<f2")[0].astype(np.float32)
+                minimum = np.frombuffer(source[2:4].tobytes(), dtype="<f2")[0].astype(np.float32)
+                nibbles = source[4:]
+                q = np.empty(32, dtype=np.float32)
+                q[:16] = (nibbles & 0x0F).astype(np.float32)
+                q[16:] = (nibbles >> 4).astype(np.float32)
+                decoded[block * 32 : (block + 1) * 32] = q * scale + minimum
+            else:
+                scale = np.frombuffer(source[:2].tobytes(), dtype="<f2")[0].astype(np.float32)
+                q = source[2:].view(np.int8).astype(np.float32)
+                decoded[block * 32 : (block + 1) * 32] = q * scale
+        return decoded
+
+    @staticmethod
+    def _unpack_q4_k_scales(packed: np.ndarray, block: int) -> tuple[int, int]:
+        """Unpack one 6-bit scale/min pair from a Q4_K 12-byte scale array."""
+        if block < 4:
+            return int(packed[block] & 0x3F), int(packed[block + 4] & 0x3F)
+        scale = int((packed[block + 4] & 0x0F) | ((packed[block - 4] >> 6) << 4))
+        minimum = int((packed[block + 4] >> 4) | ((packed[block] >> 6) << 4))
+        return scale, minimum
+
+    def _decode_q4_k_blocks(self, raw: bytes, block_count: int) -> np.ndarray:
+        """Decode Q4_K blocks using the upstream ggml 256-value layout."""
+        raw_array = np.frombuffer(raw, dtype=np.uint8)
+        decoded = np.empty(block_count * 256, dtype=np.float32)
+        for block_index in range(block_count):
+            block = raw_array[block_index * 144 : (block_index + 1) * 144]
+            d = np.frombuffer(block[:2].tobytes(), dtype="<f2")[0].astype(np.float32)
+            dmin = np.frombuffer(block[2:4].tobytes(), dtype="<f2")[0].astype(np.float32)
+            packed_scales = block[4:16]
+            quants = block[16:]
+            output_start = block_index * 256
+            for sub_block in range(8):
+                scale_q, min_q = self._unpack_q4_k_scales(packed_scales, sub_block)
+                scale = d * scale_q
+                minimum = dmin * min_q
+                quant_start = (sub_block // 2) * 32
+                quant_bytes = quants[quant_start : quant_start + 32]
+                values = (
+                    (quant_bytes & 0x0F) if sub_block % 2 == 0 else (quant_bytes >> 4)
+                ).astype(np.float32)
+                start = output_start + sub_block * 32
+                decoded[start : start + 32] = values * scale - minimum
+        return decoded
+
+    def _decode_legacy_vector(self, info: TensorInfo, byte_offset: int, count: int) -> np.ndarray:
+        if count % 32 != 0:
+            raise ValueError(f"{info.type_name} vector length must be divisible by 32")
+        bytes_per_block = self._legacy_block_bytes(info.type_name)
+        return self._decode_legacy_blocks(
+            self.tensor_bytes(info, (count // 32) * bytes_per_block, byte_offset),
+            info.type_name,
+            count // 32,
+        )
+
+    def tensor_vector(self, tensor: str | TensorInfo, index: int) -> np.ndarray:
+        """Read one column/vector from a GGML matrix without loading its siblings."""
+        info = self.tensor_info(tensor) if isinstance(tensor, str) else tensor
+        if len(info.shape) != 2:
+            raise ValueError("tensor_vector currently requires a 2-D tensor")
+        width = info.shape[0]
+        columns = info.element_count // width
+        if not 0 <= index < columns:
+            raise IndexError(index)
+        type_name = info.type_name
+        if type_name in ("F32", "F16"):
+            item_size = 4 if type_name == "F32" else 2
+            raw = self.tensor_bytes(info, width * item_size, index * width * item_size)
+            dtype = "<f4" if type_name == "F32" else "<f2"
+            return np.frombuffer(raw, dtype=dtype, count=width).astype(np.float32, copy=True)
+        if type_name in ("Q4_0", "Q4_1", "Q8_0"):
+            row_bytes = (width // 32) * self._legacy_block_bytes(type_name)
+            raw = self.tensor_bytes(info, row_bytes, index * row_bytes)
+            return self._decode_legacy_blocks(raw, type_name, width // 32)
+        if type_name == "Q4_K":
+            row_bytes = (width // 256) * 144
+            raw = self.tensor_bytes(info, row_bytes, index * row_bytes)
+            return self._decode_q4_k_blocks(raw, width // 256)
+        raise NotImplementedError(f"tensor decoder not implemented for {type_name}")
+
+    def tensor_matvec(self, tensor: str | TensorInfo, vector: np.ndarray | list[float]) -> np.ndarray:
+        """Compute W.T @ vector for a GGML matrix shaped [input, output]."""
+        info = self.tensor_info(tensor) if isinstance(tensor, str) else tensor
+        if len(info.shape) != 2:
+            raise ValueError("tensor_matvec currently requires a 2-D tensor")
+        vector_array = np.asarray(vector, dtype=np.float32)
+        input_width = info.shape[0]
+        output_width = info.element_count // input_width
+        if vector_array.shape != (input_width,):
+            raise ValueError(f"vector must have shape ({input_width},)")
+        output = np.empty(output_width, dtype=np.float32)
+        for column in range(output_width):
+            output[column] = np.dot(self.tensor_vector(info, column), vector_array)
+        return output
 
     def decode_tensor(self, tensor: str | TensorInfo) -> np.ndarray:
         """Decode a supported tensor into float32.
@@ -252,6 +390,12 @@ class GGUFReader:
             values = np.frombuffer(raw, dtype="<f2").astype(np.float32, copy=True)
         elif type_name in ("Q4_0", "Q4_1", "Q8_0"):
             values = self._decode_legacy_quant(info)
+        elif type_name == "Q4_K":
+            if count % 256 != 0:
+                raise ValueError("Q4_K tensor size must be divisible by 256")
+            values = self._decode_q4_k_blocks(
+                self.tensor_bytes(info, (count // 256) * 144), count // 256
+            )
         else:
             raise NotImplementedError(f"tensor decoder not implemented for {type_name}")
         return values.reshape(info.shape)
