@@ -1,0 +1,12 @@
+services:
+  lowram-ai:
+    build: .
+    environment:
+      LOWRAM_MODEL: /models/model.gguf
+      LOWRAM_MAX_RAM_MB: ${LOWRAM_MAX_RAM_MB:-1024}
+      LOWRAM_MAX_CONTEXT: ${LOWRAM_MAX_CONTEXT:-256}
+    ports:
+      - "${LOWRAM_PORT:-8000}:8000"
+    volumes:
+      - ./models:/models:ro
+    restart: unless-stopped

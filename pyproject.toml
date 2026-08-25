@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lowram-ai"
-version = "0.2.0"
+version = "0.3.0"
 description = "Memory-budgeted GGUF Llama inference for constrained devices"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,8 +12,15 @@ dependencies = ["numpy>=1.24"]
 license = {text = "Apache-2.0"}
 authors = [{name = "LowRAM AI contributors"}]
 
+[project.optional-dependencies]
+server = ["fastapi>=0.110", "uvicorn[standard]>=0.27", "python-multipart>=0.0.9"]
+
 [project.scripts]
 lowram-ai = "lowram_ai.cli:main"
+lowram-ai-server = "lowram_ai.api:main"
+
+[tool.setuptools.package-data]
+lowram_ai = ["web/*.html"]
 
 [tool.setuptools.packages.find]
 include = ["lowram_ai*"]

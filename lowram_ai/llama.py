@@ -420,14 +420,16 @@ class LlamaRuntime:
         repetition_penalty: float = 1.05,
         seed: int | None = 0,
     ) -> str:
-        return self.tokenizer.decode(
-            self.generate_ids(
-                prompt,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-                seed=seed,
-            )
+        prompt_ids = self.tokenizer.encode(prompt, add_bos=None)
+        generated_ids = self.generate_ids(
+            prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            seed=seed,
         )
+        # Return only the completion; callers already know the prompt and
+        # should never display the full prompt as if it were an AI answer.
+        return self.tokenizer.decode(generated_ids[len(prompt_ids):])

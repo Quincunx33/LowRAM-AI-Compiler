@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: lowram-ai
+    runtime: python
+    plan: free
+    buildCommand: pip install .[server]
+    startCommand: lowram-ai-server
+    envVars:
+      - key: LOWRAM_MODEL
+        sync: false
+      - key: LOWRAM_MAX_RAM_MB
+        value: "512"
+      - key: LOWRAM_MAX_CONTEXT
+        value: "128"
+      - key: LOWRAM_HOST
+        value: "0.0.0.0"
+      - key: LOWRAM_PORT
+        value: "10000"
+      - key: LOWRAM_API_KEY
+        sync: false
+      - key: LOWRAM_RATE_LIMIT
+        value: "60"

@@ -13,6 +13,9 @@ import numpy as np
 _TYPE_IDS = {
     "F32": 0,
     "F16": 1,
+    "BF16": 30,
+    "Q4_0": 2,
+    "Q4_1": 3,
     "Q5_0": 6,
     "Q8_0": 8,
     "Q4_K": 12,
@@ -74,7 +77,11 @@ class NativeKernel:
         type_id = _TYPE_IDS.get(info.type_name)
         if type_id is None or len(info.shape) != 2:
             return None
-        vector = np.ascontiguousarray(vector, dtype=np.float32)
+        # Keep the mmap-backed model zero-copy; only the activation vector is
+        # normalized to a contiguous, SIMD-friendly float32 buffer.
+        vector = np.require(vector, dtype=np.float32, requirements=["C", "A"])
+        if vector.ndim != 1 or vector.shape[0] != info.shape[0]:
+            raise ValueError("activation vector width does not match tensor input width")
         output_width = info.element_count // info.shape[0]
         output = np.empty(output_width, dtype=np.float32)
         status = self._lib.lowram_matvec(

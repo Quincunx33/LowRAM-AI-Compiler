@@ -223,7 +223,7 @@ class GGUFReader:
         count = info.element_count
         if info.type_name == "F32":
             return count * 4
-        if info.type_name == "F16":
+        if info.type_name in ("F16", "BF16"):
             return count * 2
         if info.type_name in ("Q4_0", "Q4_1", "Q5_0", "Q8_0"):
             if count % 32 != 0:
@@ -257,6 +257,12 @@ class GGUFReader:
             raise RuntimeError("GGUFReader is closed")
         start = info.data_offset + offset
         return bytes(self._mapping[start : start + count])
+
+    @staticmethod
+    def _decode_bf16(raw: bytes, count: int) -> np.ndarray:
+        """Decode IEEE-754 bfloat16 by shifting its bits into float32."""
+        words = np.frombuffer(raw, dtype="<u2", count=count).astype(np.uint32, copy=True)
+        return (words << 16).view("<f4")
 
     def _legacy_block_bytes(self, type_name: str) -> int:
         if type_name == "Q4_0":
@@ -393,9 +399,11 @@ class GGUFReader:
         if not 0 <= index < columns:
             raise IndexError(index)
         type_name = info.type_name
-        if type_name in ("F32", "F16"):
+        if type_name in ("F32", "F16", "BF16"):
             item_size = 4 if type_name == "F32" else 2
             raw = self.tensor_bytes(info, width * item_size, index * width * item_size)
+            if type_name == "BF16":
+                return self._decode_bf16(raw, width)
             dtype = "<f4" if type_name == "F32" else "<f2"
             return np.frombuffer(raw, dtype=dtype, count=width).astype(np.float32, copy=True)
         if type_name in ("Q4_0", "Q4_1", "Q8_0"):
@@ -446,6 +454,8 @@ class GGUFReader:
         elif type_name == "F16":
             raw = self.tensor_bytes(info, count * 2)
             values = np.frombuffer(raw, dtype="<f2").astype(np.float32, copy=True)
+        elif type_name == "BF16":
+            values = self._decode_bf16(self.tensor_bytes(info, count * 2), count)
         elif type_name in ("Q4_0", "Q4_1", "Q8_0"):
             values = self._decode_legacy_quant(info)
         elif type_name == "Q5_0":
